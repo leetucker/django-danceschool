@@ -52,9 +52,9 @@ class PayAtDoorFormPlugin(CMSPluginBase):
 
         methodChoices = [str(x[0]) for x in ATTHEDOOR_PAYMENTMETHOD_CHOICES]
 
-        reg_data = getattr(context.get('registration', None), 'data', {})
-        paymentMethod = reg_data.get('paymentMethod', None)
-        autoSubmit = reg_data.get('autoSubmit', False)
+        invoice_data = getattr(context.get('invoice', None), 'data', {})
+        paymentMethod = invoice_data.get('paymentMethod', None)
+        autoSubmit = invoice_data.get('autoSubmit', False)
 
         # Only permit auto-submit for specific valid payment methods (e.g. Cash)
         if paymentMethod in methodChoices and autoSubmit:

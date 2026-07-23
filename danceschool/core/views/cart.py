@@ -23,12 +23,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..models import (
-    Event, Invoice, InvoiceItem, DanceRole, EventRole
+    Event, Invoice, InvoiceItem, DanceRole, EventRole, Registration
 )
 from ..constants import getConstant, REG_VALIDATION_STR
 from ..signals import (
     get_cart_invoice_related, get_cart_invoice_item_related,
-    request_discounts, check_voucher
+    request_discounts, check_voucher, post_student_info
 )
 from ..helpers import getPurchasableItems
 from ..serializers import PurchasableItemSerializer, CartSerializer
@@ -47,6 +47,31 @@ def clear_reg_cart(request):
     if reg_session and 'cart' in reg_session:
         del reg_session['cart']
         request.session.modified = True
+
+
+def cart_requires_full_registration(items):
+    '''
+    Full registration (StudentInfoView) is required unless every item in the
+    cart explicitly opts out via requireFull=False. Mirrors the aggregation
+    previously performed by the pre-cart-system AjaxClassRegistrationView.
+    '''
+    return any(item.get('requireFull', True) for item in items)
+
+
+def apply_cart_payment_method(invoice, items):
+    '''
+    If every item in the cart specifies the same non-empty paymentMethod, and
+    all of them have autoSubmit set, then stamp the invoice with that payment
+    method so that the at-the-door payment plugin can offer a one-click
+    payment submission instead of a manual form. Mirrors the aggregation
+    previously performed by the pre-cart-system AjaxClassRegistrationView.
+    '''
+    methods = [item.get('paymentMethod', None) for item in items]
+    if len(set(methods)) == 1 and methods[0]:
+        invoice.data['paymentMethod'] = methods[0]
+        if all(item.get('autoSubmit', False) for item in items):
+            invoice.data['autoSubmit'] = True
+        invoice.save()
 
 
 class PurchasableItemPagination(PageNumberPagination):
@@ -526,10 +551,18 @@ class CartView(RegistrationAdjustmentsMixin, APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             invoice = self.create_invoice_from_cart(dict(new_cart_data), request)
+            apply_cart_payment_method(invoice, new_cart_data.get('items', []))
             reg_session = request.session.setdefault(REG_VALIDATION_STR, {})
             reg_session['invoice_id'] = str(invoice.id)
             reg_session['invoice_expiry'] = invoice.expirationDate.isoformat()
             request.session.modified = True
+
+            if not cart_requires_full_registration(new_cart_data.get('items', [])):
+                registration = Registration.objects.filter(invoice=invoice).first()
+                post_student_info.send(
+                    sender=self.__class__, invoice=invoice, registration=registration
+                )
+                return HttpResponseRedirect(reverse('showRegSummary'))
             return HttpResponseRedirect(self.get_success_url())
 
         # Add a read-only discount/voucher preview to the response so the cart
@@ -855,11 +888,19 @@ class CartSummaryView(RegistrationAdjustmentsMixin, TemplateView):
                 messages.error(request, str(exc))
                 return HttpResponseRedirect(reverse('cartSummary'))
 
+            apply_cart_payment_method(invoice, cart.get('items', []))
             reg_session = request.session.setdefault(REG_VALIDATION_STR, {})
             reg_session['invoice_id'] = str(invoice.id)
             reg_session['invoice_expiry'] = invoice.expirationDate.isoformat()
             reg_session['payAtDoor'] = self.payAtDoor
             request.session.modified = True
+
+            if not cart_requires_full_registration(cart.get('items', [])):
+                registration = Registration.objects.filter(invoice=invoice).first()
+                post_student_info.send(
+                    sender=self.__class__, invoice=invoice, registration=registration
+                )
+                return HttpResponseRedirect(reverse('showRegSummary'))
             return HttpResponseRedirect(reverse('getStudentInfo'))
 
         return HttpResponseRedirect(reverse('cartSummary'))

@@ -208,6 +208,7 @@ class CartItemSerializer(serializers.Serializer):
     requireFull = serializers.BooleanField(required=False)
     autoSubmit = serializers.BooleanField(required=False)
     autoFulfill = serializers.BooleanField(required=False)
+    paymentMethod = serializers.CharField(required=False, allow_blank=True)
 
     def check_door_only_field(self, value: bool, permitted: bool=False) -> bool:
         payAtDoor = self.context.get('payAtDoor', False)
@@ -240,6 +241,14 @@ class CartItemSerializer(serializers.Serializer):
 
     def validate_autoFulfill(self, value):
         return self.check_door_only_field(value, permitted=True)
+
+    def validate_paymentMethod(self, value):
+        payAtDoor = self.context.get('payAtDoor', False)
+        if value and not payAtDoor:
+            raise serializers.ValidationError(
+                'This option is unavailable for online registrations.'
+            )
+        return value
 
     def validate(self, data):
         purchasable_items = self.context.get('purchasable_items', [])
