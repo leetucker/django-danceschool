@@ -12,8 +12,8 @@ class CoreAppConfig(AppConfig):
     verbose_name = _('Core School Functions')
 
     def ready(self):
-        # Ensure that signal handlers are loaded
-        from . import handlers
+        # Ensure that signal handlers and database checks are loaded
+        from . import checks, handlers
         from .managers import EventManager
 
         # This will load all cms_plugins.py files under

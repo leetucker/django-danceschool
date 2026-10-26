@@ -381,8 +381,8 @@ class PrivateLessonStudentInfoView(FormView):
         email = form.cleaned_data.get('email')
         phone = form.cleaned_data.get('phone')
 
-        customer, created = Customer.objects.update_or_create(
-            first_name=first_name, last_name=last_name, email=email, defaults={'phone': phone}
+        customer, created = Customer.objects.get_or_create_customer(
+            first_name, last_name, email, phone=phone
         )
         # Ensure that this customer is affiliated with this lesson.
         PrivateLessonCustomer.objects.get_or_create(

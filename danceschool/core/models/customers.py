@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import IntegrityError, models, transaction
 from django.db.models import Q
 from django.contrib.auth.models import User
 from django.utils.translation import gettext_lazy as _
@@ -8,6 +8,8 @@ import logging
 from ..mixins import EmailRecipientMixin
 
 logger = logging.getLogger(__name__)
+
+CUSTOMER_UNIQUE_CONSTRAINT = 'core_customer_unique_name_email'
 
 
 class CustomerGroup(EmailRecipientMixin, models.Model):
@@ -33,6 +35,57 @@ class CustomerGroup(EmailRecipientMixin, models.Model):
         verbose_name_plural = _('Customer groups')
 
 
+class CustomerManager(models.Manager):
+
+    def get_or_create_customer(self, first_name, last_name, email, phone=None):
+        '''
+        Find the customer with this name and email, ignoring case and
+        surrounding whitespace, or create one.  Returns (customer, created).
+
+        All registration code should use this rather than get_or_create(), so
+        that "jane doe <Jane@Example.com>" finds the existing "Jane Doe
+        <jane@example.com>" instead of becoming a second customer.  If several
+        existing customers match (case variants from before this matching was
+        used), it never fails: it prefers an exact match, then one linked to a
+        user account, then the oldest.  A phone number, if given, is saved; a
+        missing one never blanks a stored one.
+        '''
+        first_name = (first_name or '').strip()
+        last_name = (last_name or '').strip()
+        email = (email or '').strip()
+
+        def find():
+            matches = list(self.filter(
+                first_name__iexact=first_name, last_name__iexact=last_name, email__iexact=email,
+            ).order_by('id'))
+            if not matches:
+                return None
+            return min(matches, key=lambda c: (
+                (c.first_name, c.last_name, c.email) != (first_name, last_name, email),
+                c.user_id is None,
+                c.id,
+            ))
+
+        customer = find()
+        created = False
+        if customer is None:
+            try:
+                with transaction.atomic(using=self.db):
+                    customer = self.create(
+                        first_name=first_name, last_name=last_name, email=email, phone=phone or None,
+                    )
+                created = True
+            except IntegrityError:
+                # Created by a concurrent request in the meantime.
+                customer = find()
+                if customer is None:
+                    raise
+        if not created and phone and customer.phone != phone:
+            customer.phone = phone
+            customer.save(update_fields=['phone'])
+        return customer, created
+
+
 class Customer(EmailRecipientMixin, models.Model):
     '''
     Not all customers choose to log in when they sign up for classes, and
@@ -41,7 +94,10 @@ class Customer(EmailRecipientMixin, models.Model):
     So, Customer objects are unique for each combination of name and email
     address, even though Users are unique by email address only.  Customers
     also store name and email information separately from the User object.
+    Use Customer.objects.get_or_create_customer() to find or create one.
     '''
+    objects = CustomerManager()
+
     user = models.OneToOneField(
         User, null=True, blank=True, verbose_name=_('User account'),
         on_delete=models.SET_NULL
@@ -186,7 +242,13 @@ class Customer(EmailRecipientMixin, models.Model):
         return '%s: %s' % (self.fullName, self.email)
 
     class Meta:
-        unique_together = ('last_name', 'first_name', 'email')
+        constraints = [
+            # Enforced in the database by migration 0060, or by
+            # merge_duplicate_customers once any duplicates are merged.
+            models.UniqueConstraint(
+                fields=('last_name', 'first_name', 'email'), name=CUSTOMER_UNIQUE_CONSTRAINT,
+            ),
+        ]
         ordering = ('last_name', 'first_name')
         permissions = (
             (

@@ -639,9 +639,8 @@ class MultiRegCustomerNameView(RegistrationAdjustmentsMixin, FormView):
             phone = form.cleaned_data.pop('er_%s_phone' % er.id, None)
             student = form.cleaned_data.pop('er_%s_student' % er.id, False)
 
-            customer, created = Customer.objects.update_or_create(
-                first_name=firstName, last_name=lastName,
-                email=email, defaults={'phone': phone}
+            customer, created = Customer.objects.get_or_create_customer(
+                firstName, lastName, email, phone=phone
             )
             er.customer = customer
             er.student = student
@@ -846,9 +845,8 @@ class StudentInfoView(RegistrationAdjustmentsMixin, FormView):
             reg.howHeardAboutUs = form.cleaned_data.pop('howHeardAboutUs', None)
 
             if not self.multiReg:
-                customer, created = Customer.objects.update_or_create(
-                    first_name=firstName, last_name=lastName,
-                    email=email, defaults={'phone': phone}
+                customer, created = Customer.objects.get_or_create_customer(
+                    firstName, lastName, email, phone=phone
                 )
                 reg.eventregistration_set.update(
                     customer=customer, student=student
