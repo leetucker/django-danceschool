@@ -546,6 +546,26 @@ class ViewOrCreateInvoiceView(PermissionRequiredMixin, UpdateView):
             )
         return super().dispatch(request, *args, **kwargs)
 
+    def payment_unavailable(self, request):
+        '''
+        The invoice is built from the Square payment data.  If there is none
+        saved and the API cannot provide it, say why and go back to the list.
+        '''
+        record = self.get_object()
+        if record.getPayment(fail_silently=True):
+            return None
+        messages.error(request, _(
+            'Cannot create an invoice for this payment: its details are not saved locally and '
+            'could not be retrieved from Square (%(reason)s).'
+        ) % {'reason': record.api_error or _('no payment data')})
+        return HttpResponseRedirect(reverse('admin:square_squarepaymentrecord_changelist'))
+
+    def get(self, request, *args, **kwargs):
+        return self.payment_unavailable(request) or super().get(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        return self.payment_unavailable(request) or super().post(request, *args, **kwargs)
+
     def form_valid(self, form):
         '''
         Create the invoice and return to the SquarePaymentRecord changelist view.

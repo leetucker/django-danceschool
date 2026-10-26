@@ -11,14 +11,54 @@ import uuid
 
 from danceschool.core.models import PaymentRecord
 from .tasks import updateSquareFees
-from .api_client import api_client, iso_timestamp_to_localtime
+from .api_client import (
+    SQUARE_API_ERRORS, api_client, describe_square_error, iso_timestamp_to_localtime,
+    record_square_failure, square_api_status,
+)
 
 
 # Define logger for this file
 logger = logging.getLogger(__name__)
 
 
-class SquarePaymentRecord(PaymentRecord):
+class SquareAPIMixin:
+    '''
+    Shared handling of Square API failures for models that read from the
+    API.  Display code passes fail_silently=True and falls back to the data
+    saved locally; operations that need fresh data let the error propagate.
+    '''
+
+    def _api_usable(self, fail_silently):
+        '''
+        Whether to call the API.  When failing silently, skip the call if
+        Square is not configured or failed moments ago (see square_api_status).
+        '''
+        if not fail_silently:
+            return True
+        ok, reason = square_api_status()
+        if not ok:
+            self.api_error = reason
+        return ok
+
+    def _api_failed(self, error, fail_silently, what):
+        '''
+        Handle an exception from the Square client: re-raise it, or record
+        why it happened and let the caller fall back to saved data.
+        '''
+        if not fail_silently:
+            raise error
+        reason = describe_square_error(error)
+        self.api_error = reason
+        logger.warning('Square API request for %s failed: %s', what, reason)
+        # A failure that will affect every request (bad credentials, rate
+        # limiting, an outage, no connection) pauses API calls for a few
+        # minutes.  One unknown ID (404) does not.
+        status = getattr(error, 'status_code', None)
+        if status is None or status in (401, 403, 429) or status >= 500:
+            record_square_failure(reason)
+
+
+class SquarePaymentRecord(SquareAPIMixin, PaymentRecord):
     '''
     Keeps a local record of Square transactions so that they can be looked up
     using the REST API.
@@ -51,9 +91,16 @@ class SquarePaymentRecord(PaymentRecord):
         '''
         return self.paymentId
 
+    # The amounts below are for display: they never raise.  They use the
+    # payment data saved locally when there is some, and otherwise ask the
+    # API.  If neither is possible they return None (and self.api_error says
+    # why), never a misleading 0.
+
     @property
     def grossAmountPaid(self):
-        payment = self.getPayment()
+        payment = self.getPayment(fail_silently=True)
+        if not payment:
+            return None
         return (
             payment.get('amount_money', {}).get('amount', 0) / 100
         )
@@ -61,7 +108,9 @@ class SquarePaymentRecord(PaymentRecord):
 
     @property
     def netAmountPaid(self):
-        payment = self.getPayment()
+        payment = self.getPayment(fail_silently=True)
+        if not payment:
+            return None
         return (
             payment.get('amount_money', {}).get('amount', 0) / 100 -
             payment.get('refunded_money', {}).get('amount', 0) / 100
@@ -70,7 +119,9 @@ class SquarePaymentRecord(PaymentRecord):
 
     @property
     def netRefund(self):
-        payment = self.getPayment()
+        payment = self.getPayment(fail_silently=True)
+        if not payment:
+            return None
         return (
             payment.get('refunded_money', {}).get('amount', 0) / 100
         )
@@ -78,8 +129,10 @@ class SquarePaymentRecord(PaymentRecord):
 
     @property
     def netFees(self):
-        payment = self.getPayment()
-        refunds = self.getRefunds(payment=payment)
+        payment = self.getPayment(fail_silently=True)
+        if not payment:
+            return None
+        refunds = self.getRefunds(payment=payment, fail_silently=True)
 
         fees = sum([
             x.get('amount_money', {}).get('amount', 0) / 100
@@ -97,7 +150,10 @@ class SquarePaymentRecord(PaymentRecord):
 
     @property
     def netRevenue(self):
-        return self.netAmountPaid - self.netFees
+        paid, fees = self.netAmountPaid, self.netFees
+        if paid is None or fees is None:
+            return None
+        return paid - fees
     netRevenue.fget.short_description = _('Net revenue')
 
     @property
@@ -117,7 +173,7 @@ class SquarePaymentRecord(PaymentRecord):
     @property
     def orderLineItems(self):
         ''' Get the line items from the Orders API data. '''
-        order_data = self.getOrder()
+        order_data = self.getOrder(fail_silently=True)
         return order_data.get('line_items', [])
 
     @property
@@ -134,15 +190,21 @@ class SquarePaymentRecord(PaymentRecord):
     
     @property
     def paidOutAmount(self):
-        return sum([x.amountPaid for x in self.getPayoutEntries()])
+        return sum([x.amountPaid or 0 for x in self.getPayoutEntries()])
 
     @property
     def paidOutDate(self):
         return max([x.payoutDate for x in self.getPayoutEntries()])
 
     def getPayment(
-        self, client=None, use_cache=True, update_cache=True, commit=True
+        self, client=None, use_cache=True, update_cache=True, commit=True,
+        fail_silently=False,
     ):
+        '''
+        The Square payment data, from the local cache if allowed, otherwise
+        from the API.  With fail_silently=True, an API failure returns the
+        cached data (or {}) and sets self.api_error, instead of raising.
+        '''
         # No need to proceed if there is no way to get the payment record from
         # the API.
         if not self.paymentId:
@@ -152,10 +214,17 @@ class SquarePaymentRecord(PaymentRecord):
         if use_cache and cached is not None:
             return cached
 
+        if not self._api_usable(fail_silently):
+            return cached or {}
+
         if not client:
             client = self.client
 
-        response = client.payments.get(self.paymentId).dict().get('payment', {})
+        try:
+            response = client.payments.get(self.paymentId).dict().get('payment', {})
+        except SQUARE_API_ERRORS as e:
+            self._api_failed(e, fail_silently, 'payment %s' % self.paymentId)
+            return cached or {}
 
         if (update_cache is True) and (response != cached):
             self.data['apiPaymentResponse'] = response
@@ -167,29 +236,39 @@ class SquarePaymentRecord(PaymentRecord):
         return response
 
     def getOrder(
-        self, client=None,  use_cache=True, update_cache=True, commit=True
+        self, client=None,  use_cache=True, update_cache=True, commit=True,
+        fail_silently=False,
     ):
         '''
         Order data from the API is not automatically imported or retained
         locally, but it can be requested and used in individual views, and is
-        cached when that occurs.
+        cached when that occurs.  fail_silently is as for getPayment().
         '''
         cached = self.data.get('apiOrderResponse', None)
         if use_cache and cached is not None:
             return cached
 
         if not self.orderId:
-            self.orderId = self.getPayment(commit=commit).get('order_id')
+            self.orderId = self.getPayment(
+                commit=commit, fail_silently=fail_silently
+            ).get('order_id')
 
         # No need to proceed if there is no way to get the order record from
         # the API.
         if not self.orderId:
             return {}
 
+        if not self._api_usable(fail_silently):
+            return cached or {}
+
         if not client:
             client = self.client
 
-        response = client.orders.get(self.orderId).dict().get('order', {})
+        try:
+            response = client.orders.get(self.orderId).dict().get('order', {})
+        except SQUARE_API_ERRORS as e:
+            self._api_failed(e, fail_silently, 'order %s' % self.orderId)
+            return cached or {}
 
         if (update_cache is True) and (response != cached):
             self.data['apiOrderResponse'] = response
@@ -200,7 +279,7 @@ class SquarePaymentRecord(PaymentRecord):
 
     def getRefunds(
             self, client=None, use_cache=True, update_cache=True, payment=None,
-            commit=True
+            commit=True, fail_silently=False,
     ):
 
         cached = self.data.get('apiRefundResponse', None)
@@ -211,16 +290,24 @@ class SquarePaymentRecord(PaymentRecord):
             client = self.client
 
         if not payment:
-            payment = self.getPayment(client, use_cache, update_cache, commit)
+            payment = self.getPayment(
+                client, use_cache, update_cache, commit, fail_silently=fail_silently
+            )
 
         response = []
 
         if payment.get('refund_ids', []):
+            if not self._api_usable(fail_silently):
+                return cached or []
             for y in payment['refund_ids']:
                 try:
                     refund_response = client.refunds.get(y).dict().get('refund', {})
                 except ApiError:
                     continue
+                except SQUARE_API_ERRORS as e:
+                    # No connection at all: stop, rather than try each refund.
+                    self._api_failed(e, fail_silently, 'refund %s' % y)
+                    return cached or []
                 else:
                     response.append(refund_response)
 
@@ -240,13 +327,23 @@ class SquarePaymentRecord(PaymentRecord):
     def refund(self, amount=None):
         # Start by ensuring that we have the most recent information on the
         # payment and what remains to be refunded.
-        payment = self.getPayment(use_cache=False, commit=False)
+        try:
+            payment = self.getPayment(use_cache=False, commit=False)
+        except SQUARE_API_ERRORS as e:
+            reason = describe_square_error(e)
+            logger.error('Unable to retrieve Square payment %s for refund: %s', self.paymentId, reason)
+            return [{
+                'status': 'error', 'errors': [{
+                    'code': 'square_api_unavailable',
+                    'message': _('Unable to retrieve the Square payment: %s') % reason,
+                }],
+            }]
         if not payment:
-            return {
+            return [{
                 'status': 'error', 'errors': [
                     {'code': 'no_payment', 'message': _('Unable to retrieve Square payment from record.')},
                 ]
-            }
+            }]
 
         # SquarePaymentRecords used to potentially reference multiple tenders,
         # but they are now associated with a single payment that can be refunded
@@ -285,14 +382,20 @@ class SquarePaymentRecord(PaymentRecord):
                 'refundAmount': float(this_refund.get('amount_money', {}).get('amount', 0)) / 100,
                 'fees': float(this_refund.get('app_fee_money', {}).get('amount', 0)) / 100,
             })
-        except ApiError as e:
-            logger.error('Error in providing Square refund: %s' % e.errors)
-            refundData.append({'status': 'error', 'errors': e.errors})            
 
             # Once the refund process is complete, fees will be calculated,
             # so schedule a task to get them and update records one minute
             # in the future.
             updateSquareFees.schedule(args=(self.pk, ), delay=60)
+        except SQUARE_API_ERRORS as e:
+            reason = describe_square_error(e)
+            logger.error('Error in providing Square refund: %s' % reason)
+            # Plain dicts, so that they can be saved in the invoice's data.
+            errors = [
+                {'code': getattr(x, 'code', None), 'message': getattr(x, 'detail', None)}
+                for x in (getattr(e, 'errors', None) or [])
+            ] or [{'code': 'square_api_unavailable', 'message': reason}]
+            refundData.append({'status': 'error', 'errors': errors})
 
         return refundData
 
@@ -300,6 +403,8 @@ class SquarePaymentRecord(PaymentRecord):
         client = kwargs.pop('client', api_client)
         super().__init__(*args, **kwargs)
         self.client = client
+        # Why the last API request for this record failed, if it did.
+        self.api_error = None
 
     class Meta:
         permissions = (
@@ -309,7 +414,7 @@ class SquarePaymentRecord(PaymentRecord):
         verbose_name_plural = _('Payment records')
 
 
-class SquarePayoutRecord(models.Model):
+class SquarePayoutRecord(SquareAPIMixin, models.Model):
     '''
     Keeps a local record of Square payouts so that they can be looked up
     using the REST API and so that square payouts can be corresponded to payment
@@ -328,9 +433,15 @@ class SquarePayoutRecord(models.Model):
 
     data = models.JSONField(_('Additional data'), default=dict, blank=True)
 
+    # For display: these never raise, and return None if there is no payout
+    # data (see SquarePaymentRecord).
+
     @property
     def amountPaid(self):
-        return self.getPayout().get('amount_money').get('amount', 0) / 100
+        payout = self.getPayout(fail_silently=True)
+        if not payout:
+            return None
+        return (payout.get('amount_money') or {}).get('amount', 0) / 100
     amountPaid.fget.short_description = _('Total payout amount')
 
     @property
@@ -340,12 +451,13 @@ class SquarePayoutRecord(models.Model):
     @property
     def payoutDate(self):
         return iso_timestamp_to_localtime(
-            self.getPayout().get('arrival_date', '')
+            self.getPayout(fail_silently=True).get('arrival_date', '')
         )
     payoutDate.fget.short_description = _('Payout deposit date')
 
     def getPayout(
-        self, client=None, use_cache=True, update_cache=True, commit=True
+        self, client=None, use_cache=True, update_cache=True, commit=True,
+        fail_silently=False,
     ):
         # No need to proceed if there is no way to get the payout record from
         # the API.
@@ -356,10 +468,17 @@ class SquarePayoutRecord(models.Model):
         if use_cache and cached is not None:
             return cached
 
+        if not self._api_usable(fail_silently):
+            return cached or {}
+
         if not client:
             client = self.client
 
-        response = client.payouts.get(self.payoutId).dict().get('payout', {})
+        try:
+            response = client.payouts.get(self.payoutId).dict().get('payout', {})
+        except SQUARE_API_ERRORS as e:
+            self._api_failed(e, fail_silently, 'payout %s' % self.payoutId)
+            return cached or {}
 
         if (update_cache is True) and (response != cached):
             self.data['apiPayoutResponse'] = response
@@ -422,6 +541,8 @@ class SquarePayoutRecord(models.Model):
         client = kwargs.pop('client', api_client)
         super().__init__(*args, **kwargs)
         self.client = client
+        # Why the last API request for this record failed, if it did.
+        self.api_error = None
 
     class Meta:
         verbose_name = _('Square payout record')
@@ -452,7 +573,10 @@ class SquarePayoutEntry(models.Model):
 
     @property
     def amountPaid(self):
-        return self.apiEntry.get('net_amount_money').get('amount', 0) / 100
+        money = self.apiEntry.get('net_amount_money')
+        if not money:
+            return None
+        return money.get('amount', 0) / 100
 
     @property
     def netRevenue(self):

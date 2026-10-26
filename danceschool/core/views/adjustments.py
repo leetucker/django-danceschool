@@ -16,7 +16,24 @@ from ..utils.timezone import ensure_localtime
 
 import logging
 
+
 logger = logging.getLogger(__name__)
+
+
+def processor_error_detail(response):
+    '''
+    The error messages in a payment processor's refund response, as one
+    string, for the message shown to staff.
+    '''
+    messages_ = []
+    for error in response.get('errors') or []:
+        if isinstance(error, dict):
+            text = error.get('message') or error.get('detail') or error.get('code')
+        else:
+            text = str(error)
+        if text:
+            messages_.append(str(text))
+    return '; '.join(messages_).rstrip('.') or str(_('unknown error'))
 
 
 #################################
@@ -61,6 +78,36 @@ class RefundConfirmationView(FinancialContextMixin, AdminSuccessURLMixin, Permis
         })
         return context
 
+    def refund_failed(self, refund_data, failed, adjustment_amounts):
+        '''
+        Stop after a failed refund: report it, record it on the invoice, and
+        apply only the refunds that already succeeded.
+        '''
+        logger.error(failed.get('errorMessage'))
+        logger.error(failed)
+
+        messages.error(self.request, failed.get('errorMessage'))
+
+        self.invoice.data['refunds'] = refund_data
+
+        total_applied = sum([x.get('refundAmount', 0) for x in refund_data if x.get('status') == 'success'])
+        total_fees = sum([x.get('fees', 0) for x in refund_data if x.get('status') == 'success'])
+
+        # Allocate whatever amount was previously successful across the
+        # items for which the refund was requested.
+        self.invoice.amountPaid -= total_applied
+
+        self.invoice.updateTotals(
+            save=True,
+            allocateAmounts={
+                'adjustments': -1*total_applied,
+                'fees': total_fees,
+            },
+            allocateWeights=adjustment_amounts
+        )
+        self.request.session.pop(REFUND_VALIDATION_STR, None)
+        return HttpResponseRedirect(self.get_success_url())
+
     def process_refund(self):
 
         refund_data = self.invoice.data.get('refunds', [])
@@ -85,8 +132,7 @@ class RefundConfirmationView(FinancialContextMixin, AdminSuccessURLMixin, Permis
             if not this_payment.refundable:
                 continue
 
-            this_payment_amount = this_payment.netAmountPaid or 0
-            this_refund_amount = min(this_payment_amount, remains_to_refund)
+            this_payment_amount = this_payment.netAmountPaid
 
             # This dictionary will be updated and then added to refund_data for
             # this invoice whether the refund is successful or not
@@ -94,9 +140,30 @@ class RefundConfirmationView(FinancialContextMixin, AdminSuccessURLMixin, Permis
                 'datetime': str(ensure_localtime(timezone.now())),
                 'id': this_payment.recordId,
                 'methodName': this_payment.methodName,
-                'amount': this_refund_amount,
             }
 
+            if this_payment_amount is None:
+                # The payment processor could not say how much was paid (for
+                # instance, its API is unavailable).  Do not guess: refund()
+                # treats a missing amount as "refund everything remaining".
+                reason = getattr(this_payment, 'api_error', None)
+                this_refund_response_data.update({
+                    'amount': 0,
+                    'status': 'error',
+                    'errorMessage': str(_(
+                        'Could not determine the amount paid by %(method)s payment %(id)s%(reason)s; '
+                        'no refund was attempted.'
+                    ) % {
+                        'method': this_payment.methodName,
+                        'id': this_payment.recordId,
+                        'reason': ' (%s)' % reason if reason else '',
+                    }),
+                })
+                refund_data.append(this_refund_response_data)
+                return self.refund_failed(refund_data, this_refund_response_data, adjustment_amounts)
+
+            this_refund_amount = min(this_payment_amount, remains_to_refund)
+            this_refund_response_data['amount'] = this_refund_amount
             this_refund_response = this_payment.refund(this_refund_amount)
 
             if not this_refund_response:
@@ -124,41 +191,21 @@ class RefundConfirmationView(FinancialContextMixin, AdminSuccessURLMixin, Permis
             else:
                 this_refund_response_data.update({
                     'status': 'error',
-                    'errorMessage': _('An unkown error has occurred. '
-                                      'Check payment processor records for refund status.'),
+                    'errorMessage': str(
+                        _('Error from the payment processor: %(detail)s. '
+                          'Check payment processor records for refund status.')
+                        % {'detail': processor_error_detail(this_refund_response[0])}
+                    ),
                     'response': [dict(this_refund_response[0]), ],
                     'id': this_payment.recordId,
                     'methodName': this_payment.methodName,
-                    'invoice': self.invoice.id,
+                    'invoice': str(self.invoice.id),
                     'refundAmount': this_refund_amount,
                 })
             refund_data.append(this_refund_response_data)
 
             if this_refund_response_data.get('status') == 'error':
-                logger.error(this_refund_response_data.get('errorMessage'))
-                logger.error(this_refund_response_data)
-
-                messages.error(self.request, this_refund_response_data.get('errorMessage'))
-
-                self.invoice.data['refunds'] = refund_data
-
-                total_applied = sum([x.get('refundAmount', 0) for x in refund_data if x.get('status') == 'success'])
-                total_fees = sum([x.get('fees', 0) for x in refund_data if x.get('status') == 'success'])
-
-                # Allocate whatever amount was previously successful across the
-                # items for which the refund was requested.
-                self.invoice.amountPaid -= total_applied
-
-                self.invoice.updateTotals(
-                    save=True,
-                    allocateAmounts={
-                        'adjustments': -1*total_applied,
-                        'fees': total_fees,
-                    },
-                    allocateWeights=adjustment_amounts
-                )
-                self.request.session.pop(REFUND_VALIDATION_STR, None)
-                return HttpResponseRedirect(self.get_success_url())
+                return self.refund_failed(refund_data, this_refund_response_data, adjustment_amounts)
 
         # If there were no errors, then check to ensure that the entire request refund was refunded.
         # If so, then return success, otherwise return indicating that the refund was not completely
